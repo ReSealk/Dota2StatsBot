@@ -5,7 +5,7 @@
 
 клонирование репозитории
 ```bash
-git clone https://github.com
+git clone https://github.com/ReSealk/Dota2StatsBot.git
 cd dota2statsbot
 ```
 
