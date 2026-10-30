@@ -6,6 +6,9 @@ from discord.ui import View, Button, button
 import os
 from dotenv import load_dotenv
 import aiohttp
+import asyncio
+import io
+from PIL import Image, ImageDraw, ImageFont
 
 load_dotenv(dotenv_path='configs.env')
 botToken = os.getenv('BOT_TOKEN')
@@ -24,9 +27,16 @@ print('connected to database')
 
 client = commands.Bot(command_prefix='d!', intents=intents, help_command=None)
 
+STEAM_MEDIA_PREFIX = "https://media.steampowered.com"
+ITEM_ICON_SIZE = 64
+ITEM_ICON_PADDING = 8
+LABEL_LINE_HEIGHT = 14
+LABEL_MAX_LINES = 2
+LABEL_BLOCK_HEIGHT = LABEL_LINE_HEIGHT * LABEL_MAX_LINES  # 28 px под две строки
 
+
+# ---------- HTTP ----------
 async def fetch_json(url: str, headers: dict | None = None, params: dict | None = None):
-    """Асинхронный GET -> JSON. Возвращает (status, data)."""
     async with aiohttp.ClientSession() as session:
         async with session.get(url, headers=headers, params=params) as resp:
             try:
@@ -36,6 +46,174 @@ async def fetch_json(url: str, headers: dict | None = None, params: dict | None 
             return resp.status, data
 
 
+async def download_bytes(session: aiohttp.ClientSession, url: str) -> bytes | None:
+    try:
+        async with session.get(url) as resp:
+            if resp.status == 200:
+                return await resp.read()
+    except Exception:
+        pass
+    return None
+
+
+# ---------- Шрифт ----------
+def _load_font(size: int) -> ImageFont.ImageFont:
+    candidates = [
+        "DejaVuSans.ttf",
+        "arial.ttf",
+        "Arial.ttf",
+        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+        "/System/Library/Fonts/Supplemental/Arial.ttf",
+        "C:\\Windows\\Fonts\\arial.ttf",
+    ]
+    for path in candidates:
+        try:
+            return ImageFont.truetype(path, size)
+        except Exception:
+            continue
+    return ImageFont.load_default()
+
+
+def _measure(font, text: str) -> float:
+    try:
+        return font.getlength(text)
+    except AttributeError:
+        return font.getsize(text)[0]
+
+
+def _wrap_two_lines(text: str, font, max_width: int) -> list[str]:
+    """
+    Разбивает текст максимум на 2 строки по ширине.
+    Если не влезает — обрезает вторую строку с '...'.
+    """
+    if _measure(font, text) <= max_width:
+        return [text]
+
+    words = text.split()
+    if not words:
+        return [""]
+
+    # подбираем первое слово/слова, которые влезут в первую строку
+    line1 = ""
+    idx = 0
+    for i, w in enumerate(words):
+        candidate = (line1 + " " + w).strip()
+        if _measure(font, candidate) <= max_width:
+            line1 = candidate
+            idx = i + 1
+        else:
+            break
+
+    # остальное — вторая строка
+    rest = " ".join(words[idx:]).strip()
+
+    # если первая строка пустая (одно длинное слово) — режем по символам
+    if not line1:
+        line1 = ""
+        for ch in text:
+            if _measure(font, line1 + ch) > max_width:
+                break
+            line1 += ch
+        rest = text[len(line1):].strip()
+
+    if _measure(font, rest) > max_width:
+        ell = "..."
+        while rest and _measure(font, rest + ell) > max_width:
+            rest = rest[:-1]
+        rest = rest + ell if rest else ""
+
+    return [line1, rest]
+
+
+def _draw_centered_line(draw, text: str, font, center_x: int, y: int, fill):
+    if not text:
+        return
+    w = _measure(font, text)
+    draw.text((center_x - w / 2, y), text, font=font, fill=fill)
+
+
+# ---------- Pillow: билд в 2 ряда (основные + backpack), подписи в 2 строки ----------
+async def build_items_image(main_items: list[tuple[str, str]],
+                            backpack_items: list[tuple[str, str]]) -> io.BytesIO | None:
+    """
+    main_items: [(name, url), ...] — 6 слотов
+    backpack_items: [(name, url), ...] — 3 слота, подписи с префиксом [bp]
+    Возвращает BytesIO или None.
+    """
+    all_items = main_items + backpack_items
+    if not all_items:
+        return None
+
+    async with aiohttp.ClientSession() as session:
+        results = await asyncio.gather(
+            *(download_bytes(session, url) for _, url in all_items),
+            return_exceptions=True,
+        )
+
+    font = _load_font(11)
+    text_fill = (255, 255, 255, 255)
+
+    prepared_main: list[tuple[Image.Image, str]] = []
+    prepared_bp: list[tuple[Image.Image, str]] = []
+
+    for (name, _url), raw in zip(all_items, results):
+        if isinstance(raw, Exception) or not raw:
+            img = Image.new("RGBA", (ITEM_ICON_SIZE, ITEM_ICON_SIZE), (40, 40, 40, 255))
+        else:
+            try:
+                img = Image.open(io.BytesIO(raw)).convert("RGBA")
+                img = img.resize((ITEM_ICON_SIZE, ITEM_ICON_SIZE), Image.LANCZOS)
+            except Exception:
+                img = Image.new("RGBA", (ITEM_ICON_SIZE, ITEM_ICON_SIZE), (40, 40, 40, 255))
+
+        if len(prepared_main) < len(main_items):
+            prepared_main.append((img, name))
+        else:
+            prepared_bp.append((img, f"[bp] {name}"))
+
+    # сколько колонок и рядов
+    cols = max(len(prepared_main), len(prepared_bp), 1)
+    rows = 2 if prepared_bp else 1
+
+    cell_w = ITEM_ICON_SIZE
+    cell_h = LABEL_BLOCK_HEIGHT + ITEM_ICON_SIZE
+
+    width = cols * cell_w + (cols + 1) * ITEM_ICON_PADDING
+    height = rows * cell_h + (rows + 1) * ITEM_ICON_PADDING
+
+    canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+    draw = ImageDraw.Draw(canvas)
+
+    def draw_row(items, row_index):
+        y_top = ITEM_ICON_PADDING + row_index * (cell_h + ITEM_ICON_PADDING)
+        x = ITEM_ICON_PADDING
+        for icon, name in items:
+            center_x = x + ITEM_ICON_SIZE / 2
+
+            # подпись в 2 строки
+            lines = _wrap_two_lines(name, font, ITEM_ICON_SIZE + 8)
+            ly = y_top
+            for line in lines[:LABEL_MAX_LINES]:
+                _draw_centered_line(draw, line, font, center_x, ly, text_fill)
+                ly += LABEL_LINE_HEIGHT
+
+            # иконка
+            icon_y = y_top + LABEL_BLOCK_HEIGHT
+            canvas.paste(icon, (x, icon_y), icon)
+
+            x += ITEM_ICON_SIZE + ITEM_ICON_PADDING
+
+    draw_row(prepared_main, 0)
+    if prepared_bp:
+        draw_row(prepared_bp, 1)
+
+    buf = io.BytesIO()
+    canvas.save(buf, format="PNG")
+    buf.seek(0)
+    return buf
+
+
+# ---------- Утилиты ----------
 def convert(seconds):
     seconds = seconds % (24 * 3600)
     hour = seconds // 3600
@@ -67,11 +245,14 @@ async def get_items_map():
             _items_cache = {}
             for key, item in items.items():
                 if isinstance(item, dict) and 'id' in item:
-                    _items_cache[item['id']] = item.get('dname') or key
+                    _items_cache[item['id']] = {
+                        'name': item.get('dname') or key,
+                        'img': item.get('img'),
+                    }
     return _items_cache or {}
 
 
-# ---------- Меню игроков: 10 кнопок ----------
+# ---------- Меню игроков ----------
 class PlayersView(View):
     def __init__(self, match_id: int, players: list, heroes_map: dict):
         super().__init__(timeout=180)
@@ -108,7 +289,6 @@ class PlayersView(View):
             gpm = player.get('gold_per_min', 0)
             hero_damage = player.get('hero_damage', 0)
             hero_healing = player.get('hero_healing', 0)
-            damage_taken = player.get('damage_taken', 'н/д')
 
             embed = discord.Embed(
                 title=f"{player_name} — {hero_name}",
@@ -117,45 +297,47 @@ class PlayersView(View):
             embed.add_field(name="KDA", value=f"{k}/{d}/{a}", inline=True)
             embed.add_field(name="GPM", value=str(gpm), inline=True)
             embed.add_field(name="Нанесено урона", value=str(hero_damage), inline=True)
-            embed.add_field(name="Получено урона", value=str(damage_taken), inline=True)
             embed.add_field(name="Лечение", value=str(hero_healing), inline=True)
 
-            item_fields = []
+            # ---- Билд (только картинка) ----
+            main_items: list[tuple[str, str]] = []
+            bp_items: list[tuple[str, str]] = []
+
             for slot in range(6):
                 item_id = player.get(f'item_{slot}', 0)
                 if item_id:
-                    item_fields.append(items_map.get(item_id, f"Предмет #{item_id}"))
+                    info = items_map.get(item_id, {'name': f"Предмет #{item_id}", 'img': None})
+                    if info.get('img'):
+                        main_items.append((info['name'], STEAM_MEDIA_PREFIX + info['img']))
+                    else:
+                        main_items.append((info['name'], ""))
+
             for slot in range(3):
                 item_id = player.get(f'backpack_{slot}', 0)
                 if item_id:
-                    item_fields.append(f"[backpack] {items_map.get(item_id, f'Предмет #{item_id}')}")
+                    info = items_map.get(item_id, {'name': f"Предмет #{item_id}", 'img': None})
+                    if info.get('img'):
+                        bp_items.append((info['name'], STEAM_MEDIA_PREFIX + info['img']))
+                    else:
+                        bp_items.append((info['name'], ""))
 
-            embed.add_field(
-                name="Билд",
-                value="\n".join(item_fields) if item_fields else "нет данных",
-                inline=False,
+            build_image = await build_items_image(main_items, bp_items)
+
+            files = []
+            if build_image is not None:
+                files.append(discord.File(build_image, filename="build.png"))
+                embed.set_image(url="attachment://build.png")
+
+            await interaction.response.send_message(
+                embed=embed,
+                files=files if files else discord.utils.MISSING,
+                ephemeral=True,
             )
-
-            buffs = []
-            neutral = player.get('neutral_item')
-            if neutral:
-                buffs.append(f"Нейтральный предмет: {items_map.get(neutral, f'#{neutral}')}")
-            ability_upgrades = player.get('ability_upgrades_arr')
-            if ability_upgrades:
-                buffs.append(f"Апгрейды способностей: {len(ability_upgrades)} (есть в данных)")
-
-            embed.add_field(
-                name="Баффы / доп.",
-                value="\n".join(buffs) if buffs else "нет данных",
-                inline=False,
-            )
-
-            await interaction.response.send_message(embed=embed, ephemeral=True)
 
         return callback
 
 
-# ---------- Основное View с двумя кнопками ----------
+# ---------- Основное View ----------
 class MyView(View):
     def __init__(self, match_id: int):
         super().__init__()
@@ -215,6 +397,7 @@ class MyView(View):
         await interaction.response.send_message(embed=embed, view=view, ephemeral=True)
 
 
+# ---------- События и команды ----------
 @client.event
 async def on_ready():
     print(f'connected to discord as {client.user}')
