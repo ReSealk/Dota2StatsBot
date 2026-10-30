@@ -23,7 +23,16 @@ class DotaBot(commands.Bot):
 
     async def setup_hook(self):
         await api.start()
-        for ext in ("cogs.dota", "cogs.furry", "cogs.admin", "cogs.help"):
+        for ext in (
+            "cogs.dota",
+            "cogs.furry",
+            "cogs.admin",
+            "cogs.help",
+            "cogs.profile",
+            "cogs.live",
+            "cogs.daily",
+            "cogs.fun",
+        ):
             try:
                 await self.load_extension(ext)
                 log.info("loaded %s", ext)
